@@ -3,7 +3,7 @@
  * Input file should follow the format:
  * - line n: node_id friend_num ad_num 
  * - line n+1: friend_1 friend_2 ... friend_m
- * - line n+2: ad_1 ad_1_like_prob ad_2 ad_2_like_prob ... ad_m'_like_prob
+ * - line n+2: ad_1 ad_1_label ad_2 ad_2_label ... ad_m'_label
  */
 
 #include <cassert>
@@ -15,11 +15,12 @@
 #include <vector>
 
 #define NEG_SAMPLING_POWER .75
-#define DISPLAY_ITER 100
+#define SIGMOID_BOUND 10
+#define DISPLAY_ITER 10000
 
 const char *data_file = "";
-const char *X_output_file = "";
-const char *Y_output_file = "";
+const char *X_output_file = "./X_embed.txt";
+const char *Y_output_file = "./Y_embed.txt";
 int D = 100;
 int K = 5;
 int num_threads = 1;
@@ -50,16 +51,17 @@ void ReadData() {
 
     int node_id, friend_num, ad_num;
     while (fscanf(pFILE, "%d %d %d", &node_id, &friend_num, &ad_num) != EOF) {
-        int friend_id, ad_id;
-        float ad_prob;
+        num_nodes = std::max(num_nodes, node_id + 1);
+
+        int friend_id, ad_id, ad_label;
         for (int i = 0; i < friend_num; ++ i) {
             fscanf(pFILE, "%d", &friend_id);
-            num_nodes = std::max(num_nodes, friend_id);
+            num_nodes = std::max(num_nodes, friend_id + 1);
         }
         
         for (int i = 0; i < ad_num; ++ i) {
-            fscanf(pFILE, "%d %f", &ad_id, &ad_prob);
-            num_ads = std::max(num_ads, ad_id); 
+            fscanf(pFILE, "%d %d", &ad_id, &ad_label);
+            num_ads = std::max(num_ads, ad_id + 1); 
         }
     }
 
@@ -74,11 +76,10 @@ void InitThreadsOffset() {
     for (int i = 0; i < num_nodes; ++ i) {
         if (i % nodes_per_thread == 0) threads_offset[i / nodes_per_thread] = ftell(pFILE);
         int node_id, friend_num, ad_num;
-        int friend_id, ad_id;
-        float ad_prob;
+        int friend_id, ad_id, ad_label;
         fscanf(pFILE, "%d %d %d", &node_id, &friend_num, &ad_num);
         for (int i = 0; i < friend_num; ++ i) fscanf(pFILE, "%d", &friend_id);
-        for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %f", &ad_id, &ad_prob);
+        for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %d", &ad_id, &ad_label);
     }
     fclose(pFILE);
 }
@@ -94,10 +95,9 @@ void InitAliasTable() {
     int node_id, friend_num, ad_num;
     while (fscanf(pFILE, "%d %d %d", &node_id, &friend_num, &ad_num) != EOF) {
         node_degree[node_id] = pow(friend_num, NEG_SAMPLING_POWER);
-        int friend_id, ad_id;
-        float ad_prob;
+        int friend_id, ad_id, ad_label;
         for (int i = 0; i < friend_num; ++ i) fscanf(pFILE, "%d", &friend_id);
-        for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %f", &ad_id, &ad_prob);
+        for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %d", &ad_id, &ad_label);
     }
 
     float sum = 0;
@@ -146,8 +146,8 @@ void InitEmbeddingMatrix() {
 float SigmoidInnerProduct(float* x, float* y) {
     float ip = 0;
     for (int i = 0; i < D; ++ i) ip += x[i] * y[i];
-    if (ip >= 10) ip = 10;
-    if (ip <= -10) ip = -10;
+    if (ip >= SIGMOID_BOUND) ip = SIGMOID_BOUND;
+    if (ip <= -SIGMOID_BOUND) ip = -SIGMOID_BOUND;
     return (float)( 1.0 / (1.0 + exp(-ip)) );
 }
 
@@ -162,43 +162,41 @@ void Update(float *x, float *dx) {
     }
 }
 
-void TrainSample(int node_id, int friend_id, int ad_id, float ad_like_prob,
-        std::default_random_engine& gen, 
-        float& line_loss, int& line_count, float& ctr_loss, int& ctr_count) {
+float TrainNbrPair(int node_id, int friend_id, std::default_random_engine& gen) {
+    float loss = 0;
     std::vector<int> negatives(K);
 
     // postive friend
     float sigmoid = SigmoidInnerProduct(&X[node_id * D], &X[friend_id * D]);
     AccumulateGradient(&DX[node_id * D], &X[friend_id * D], 1 - sigmoid);
     AccumulateGradient(&DX[friend_id * D], &X[node_id * D], 1 - sigmoid);
-    line_loss += -std::log(sigmoid);
+    loss += -std::log(sigmoid);
     
     // negative friend
-    std::uniform_int_distribution<int> neg_dist(0, num_nodes - 1);
-    std::uniform_real_distribution<float> prob_dist(0, 1);
     for (int i = 0; i < K; ++ i) {
         negatives[i] = friend_id;
-        while (negatives[i] == friend_id) negatives[i] = AliasSample(gen);
+        while (negatives[i] == friend_id || negatives[i] == node_id) negatives[i] = AliasSample(gen);
         sigmoid = SigmoidInnerProduct(&X[node_id * D], &X[negatives[i] * D]);
         AccumulateGradient(&DX[node_id * D], &X[negatives[i] * D], -sigmoid);
         AccumulateGradient(&DX[negatives[i] * D], &X[node_id * D], -sigmoid);
-        line_loss += -std::log(1 - sigmoid);
+        loss += -std::log(1 - sigmoid);
     }
-    line_count ++;
-
-    // ad
-    if (ad_id != -1) {
-        sigmoid = SigmoidInnerProduct(&X[node_id * D], &Y[ad_id * D]);
-        AccumulateGradient(&DX[node_id * D], &Y[ad_id * D], lambda * (ad_like_prob - sigmoid));
-        AccumulateGradient(&DY[ad_id * D], &X[node_id * D], lambda * (ad_like_prob - sigmoid));
-        ctr_loss += -(ad_like_prob * std::log(sigmoid) + (1 - ad_like_prob) * std::log(1 - sigmoid));
-        ctr_count ++;
-    }
-
+ 
     Update(&X[node_id * D], &DX[node_id * D]);
     Update(&X[friend_id * D], &DX[friend_id * D]);
     for (int i = 0; i < K; ++ i) Update(&X[negatives[i] * D], &DX[negatives[i] * D]);
-    if (ad_id != -1) Update(&Y[ad_id * D], &DY[ad_id * D]);
+    
+    return loss;
+}
+
+float TrainAdPair(int node_id, int ad_id, int ad_label) {
+    float sigmoid = SigmoidInnerProduct(&X[node_id * D], &Y[ad_id * D]);
+    AccumulateGradient(&DX[node_id * D], &Y[ad_id * D], lambda * (ad_label - sigmoid));
+    AccumulateGradient(&DY[ad_id * D], &X[node_id * D], lambda * (ad_label - sigmoid));
+    float loss = ad_label == 0 ? -std::log(1 - sigmoid) : -std::log(sigmoid);
+    Update(&X[node_id * D], &DX[node_id * D]);
+    Update(&Y[ad_id * D], &DY[ad_id * D]);
+    return loss;
 }
 
 void TrainNext(FILE* pFILE, std::default_random_engine& gen, 
@@ -207,25 +205,18 @@ void TrainNext(FILE* pFILE, std::default_random_engine& gen,
     int node_id, friend_num, ad_num;
     fscanf(pFILE, "%d %d %d", &node_id, &friend_num, &ad_num);
 
-    std::vector<int> friends(friend_num), ads(ad_num);
-    std::vector<float> ads_prob(ad_num);
+    std::vector<int> friends(friend_num), ads(ad_num), ads_label(ad_num);
     for (int i = 0; i < friend_num; ++ i) fscanf(pFILE, "%d", &friends[i]);
-    for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %f", &ads[i], &ads_prob[i]);
+    for (int i = 0; i < ad_num; ++ i) fscanf(pFILE, "%d %d", &ads[i], &ads_label[i]);
 
-    if (friend_num != 0 && ad_num != 0) {
-        std::uniform_int_distribution<int> friends_dist(0, friend_num - 1);
-        std::uniform_int_distribution<int> ads_dist(0, ad_num - 1);
-        
-        int N = std::max(friend_num, ad_num);
-        for (int i = 0; i < N; ++ i) {
-            int friend_id = friends[friends_dist(gen)];
-            int ad_sample = ads_dist(gen), ad_id = ads[ad_sample], ad_like_prob = ads_prob[ad_sample];
-            TrainSample(node_id, friend_id, ad_id, ad_like_prob, gen, 
-                    line_loss, line_count, ctr_loss, ctr_count);
-        }
-    } else if (friend_num != 0) {
-        for (int i = 0; i < friend_num; ++ i) 
-            TrainSample(node_id, friends[i], -1, 0, gen, line_loss, line_count, ctr_loss, ctr_count);
+    for (int i = 0; i < friend_num; ++ i) {
+        line_loss += TrainNbrPair(node_id, friends[i], gen);
+        line_count ++;
+    }
+
+    for (int i = 0; i < ad_num; ++ i) {
+        ctr_loss += TrainAdPair(node_id, ads[i], ads_label[i]);
+        ctr_count ++;
     }
 }
 
